@@ -15,7 +15,7 @@ export async function POST(req: Request) {
   try {
     const { connection_id } = await req.json();
 
-    const { data: conn, error } = await supabase
+    const { data: conn } = await supabase
       .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
@@ -32,6 +32,7 @@ export async function POST(req: Request) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
       },
       body: JSON.stringify({

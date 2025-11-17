@@ -32,6 +32,7 @@ export async function POST(req: Request) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
       },
       body: JSON.stringify({
