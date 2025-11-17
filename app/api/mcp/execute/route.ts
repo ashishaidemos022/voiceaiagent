@@ -38,7 +38,7 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "exec",
-        method: "tools.call",
+        method: "tools/call",
         params: {
           name: tool_name,
           arguments: parameters

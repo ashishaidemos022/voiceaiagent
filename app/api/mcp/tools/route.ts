@@ -38,7 +38,7 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "tools-list",
-        method: "tools.list"
+        method: "tools/list"
       })
     });
 
