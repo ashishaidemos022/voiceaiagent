@@ -1,29 +1,54 @@
-// app/api/mcp/connections/route.ts
+"use server";
+
 import { supabaseAdmin } from "@/lib/db";
+import { corsHeaders, handleOptions } from "@/lib/cors";
+
+export async function OPTIONS() {
+  return handleOptions();
+}
 
 export async function POST(req: Request) {
-  const { name, server_url, api_key, user_id } = await req.json();
+  try {
+    const { name, server_url, api_key, user_id } = await req.json();
 
-  // TODO: auth check - verify user_id matches current session
+    if (!name || !server_url || !api_key) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: "Missing required fields: name, server_url, api_key"
+      }), {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
 
-  const { data, error } = await supabaseAdmin
-    .from("mcp_connections")
-    .insert({
-      name,
-      server_url,
-      api_key,
-      user_id
-    })
-    .select()
-    .single();
+    const { data, error } = await supabaseAdmin
+      .from("mcp_connections")
+      .insert({
+        name,
+        server_url,
+        api_key,
+        user_id: user_id ?? null
+      })
+      .select()
+      .single();
 
-  if (error) {
-    return Response.json({ success: false, error: error.message }, { status: 500 });
+    if (error) throw error;
+
+    return new Response(JSON.stringify({
+      success: true,
+      connection_id: data.id
+    }), {
+      status: 200,
+      headers: corsHeaders
+    });
+
+  } catch (err: any) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: err.message
+    }), {
+      status: 500,
+      headers: corsHeaders
+    });
   }
-
-  return Response.json({
-    success: true,
-    connection_id: data.id,
-    name: data.name
-  });
 }
