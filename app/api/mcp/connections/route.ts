@@ -22,12 +22,11 @@ export async function POST(req: Request) {
     }
 
     const { data, error } = await supabaseAdmin
-      .from("mcp_connections")
+      .from("va_mcp_connections")
       .insert({
         name,
         server_url,
-        api_key,
-        user_id: user_id ?? null
+        api_key
       })
       .select()
       .single();

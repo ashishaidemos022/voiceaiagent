@@ -23,7 +23,7 @@ export async function POST(req: Request) {
     }
 
     const { data: conn, error } = await supabaseAdmin
-      .from("mcp_connections")
+      .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
       .single();
