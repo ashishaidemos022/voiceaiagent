@@ -1,53 +1,43 @@
-"use server";
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+import { corsHeaders } from "@/lib/cors";
 
-import { supabaseAdmin } from "@/lib/db";
-import { corsHeaders, handleOptions } from "@/lib/cors";
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
 export async function OPTIONS() {
-  return handleOptions();
+  return NextResponse.json({}, { headers: corsHeaders });
 }
 
 export async function POST(req: Request) {
   try {
-    const { name, server_url, api_key, user_id } = await req.json();
+    const body = await req.json();
+    const { name, server_url, api_key } = body;
 
-    if (!name || !server_url || !api_key) {
-      return new Response(JSON.stringify({
-        success: false,
-        error: "Missing required fields: name, server_url, api_key"
-      }), {
-        status: 400,
-        headers: corsHeaders
-      });
+    if (!server_url.startsWith("https://")) {
+      return NextResponse.json(
+        { success: false, error: "MCP server URL must start with https://" },
+        { status: 400, headers: corsHeaders }
+      );
     }
 
-    const { data, error } = await supabaseAdmin
-      .from("va_mcp_connections")
+    const { data, error } = await supabase
+      .from("mcp_connections")
       .insert({
         name,
         server_url,
-        api_key
+        api_key,
+        status: "pending"
       })
       .select()
       .single();
 
     if (error) throw error;
 
-    return new Response(JSON.stringify({
-      success: true,
-      connection_id: data.id
-    }), {
-      status: 200,
-      headers: corsHeaders
-    });
-
-  } catch (err: any) {
-    return new Response(JSON.stringify({
-      success: false,
-      error: err.message
-    }), {
-      status: 500,
-      headers: corsHeaders
-    });
+    return NextResponse.json({ success: true, connection: data }, { headers: corsHeaders });
+  } catch (e: any) {
+    return NextResponse.json({ success: false, error: e.message }, { status: 500, headers: corsHeaders });
   }
 }
