@@ -16,7 +16,7 @@ export async function POST(req: Request) {
     const { connection_id, tool_name, parameters } = await req.json();
 
     const { data: conn } = await supabase
-      .from("mcp_connections")
+      .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
       .single();

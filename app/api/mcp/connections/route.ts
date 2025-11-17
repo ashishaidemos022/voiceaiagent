@@ -24,7 +24,7 @@ export async function POST(req: Request) {
     }
 
     const { data, error } = await supabase
-      .from("mcp_connections")
+      .from("va_mcp_connections")
       .insert({
         name,
         server_url,

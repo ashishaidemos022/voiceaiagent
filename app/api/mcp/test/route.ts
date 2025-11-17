@@ -16,7 +16,7 @@ export async function POST(req: Request) {
     const { connection_id } = await req.json();
 
     const { data: conn, error } = await supabase
-      .from("mcp_connections")
+      .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
       .single();
@@ -51,7 +51,7 @@ export async function POST(req: Request) {
     }
 
     await supabase
-      .from("mcp_connections")
+      .from("va_mcp_connections")
       .update({
         status: "active",
         last_health_check: new Date().toISOString()
