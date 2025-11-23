@@ -29,7 +29,8 @@ export async function POST(req: Request) {
         name,
         server_url,
         api_key,
-        status: "pending"
+        status: "pending",
+        user_id
       })
       .select()
       .single();

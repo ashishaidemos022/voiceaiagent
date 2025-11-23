@@ -13,21 +13,42 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   try {
-    const { connection_id } = await req.json();
+    const { connection_id, user_id } = await req.json();
 
-    const { data: conn } = await supabase
+    if (!user_id) {
+      return NextResponse.json(
+        { success: false, error: "Missing user_id" },
+        { status: 400, headers: corsHeaders }
+      );
+    }
+
+    if (!connection_id) {
+      return NextResponse.json(
+        { success: false, error: "Missing connection_id" },
+        { status: 400, headers: corsHeaders }
+      );
+    }
+
+    // ---------------------------
+    // 🔐 VALIDATE CONNECTION BELONGS TO USER
+    // ---------------------------
+    const { data: conn, error: connErr } = await supabase
       .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
+      .eq("user_id", user_id)
       .single();
 
-    if (!conn) {
+    if (connErr || !conn) {
       return NextResponse.json(
-        { success: false, error: "Connection not found" },
+        { success: false, error: "Connection not found or unauthorized" },
         { status: 404, headers: corsHeaders }
       );
     }
 
+    // ---------------------------
+    // 🔗 CALL THE MCP SERVER
+    // ---------------------------
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
@@ -46,15 +67,53 @@ export async function POST(req: Request) {
 
     if (!response.ok) {
       return NextResponse.json(
-        { success: false, error: `HTTP ${response.status}`, response: json },
+        { 
+          success: false, 
+          error: `HTTP ${response.status}`, 
+          response: json 
+        },
         { headers: corsHeaders }
       );
     }
 
+    const tools = json?.result?.tools ?? [];
+
+    // ---------------------------
+    // 📝 UPSERT TOOLS INTO Supabase
+    // ---------------------------
+    const upsertPayload = tools.map((tool: any) => ({
+      connection_id,
+      user_id, // REQUIRED
+      tool_name: tool.name,
+      description: tool.description ?? "",
+      parameters_schema: tool.inputSchema ?? {},
+      is_enabled: true
+    }));
+
+    if (upsertPayload.length > 0) {
+      const { error: upErr } = await supabase
+        .from("va_mcp_tools")
+        .upsert(upsertPayload, {
+          onConflict: "connection_id,tool_name"
+        });
+
+      if (upErr) {
+        return NextResponse.json(
+          { 
+            success: false, 
+            error: "Failed saving tools",
+            details: upErr.message 
+          },
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
     return NextResponse.json(
-      { success: true, tools: json?.result?.tools ?? [] },
+      { success: true, tools },
       { headers: corsHeaders }
     );
+
   } catch (e: any) {
     return NextResponse.json(
       { success: false, error: e.message },
