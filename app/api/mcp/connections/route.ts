@@ -14,7 +14,22 @@ export async function OPTIONS() {
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { name, server_url, api_key } = body;
+    const { name, server_url, api_key, user_id } = body;
+
+    // --- Input validation ---
+    if (!user_id) {
+      return NextResponse.json(
+        { success: false, error: "Missing user_id (required)" },
+        { status: 400, headers: corsHeaders }
+      );
+    }
+
+    if (!server_url || typeof server_url !== "string") {
+      return NextResponse.json(
+        { success: false, error: "Missing or invalid MCP server_url" },
+        { status: 400, headers: corsHeaders }
+      );
+    }
 
     if (!server_url.startsWith("https://")) {
       return NextResponse.json(
@@ -23,6 +38,7 @@ export async function POST(req: Request) {
       );
     }
 
+    // --- Insert into Supabase ---
     const { data, error } = await supabase
       .from("va_mcp_connections")
       .insert({
@@ -37,8 +53,14 @@ export async function POST(req: Request) {
 
     if (error) throw error;
 
-    return NextResponse.json({ success: true, connection: data }, { headers: corsHeaders });
+    return NextResponse.json(
+      { success: true, connection: data },
+      { headers: corsHeaders }
+    );
   } catch (e: any) {
-    return NextResponse.json({ success: false, error: e.message }, { status: 500, headers: corsHeaders });
+    return NextResponse.json(
+      { success: false, error: e.message ?? "Unexpected server error" },
+      { status: 500, headers: corsHeaders }
+    );
   }
 }
