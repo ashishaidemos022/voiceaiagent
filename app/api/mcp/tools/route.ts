@@ -7,6 +7,51 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+// -------------------------
+// 🔧 Universal Schema Normalizer
+// -------------------------
+function normalizeSchema(schema: any): any {
+  if (!schema) return {};
+
+  // Already JSON Schema
+  if (schema.type === "object" && schema.properties) {
+    return schema;
+  }
+
+  // Array-style parameter list → convert to JSON Schema
+  if (Array.isArray(schema)) {
+    const properties: Record<string, any> = {};
+    const required: string[] = [];
+
+    for (const p of schema) {
+      if (!p?.name) continue;
+
+      properties[p.name] = {
+        type: p.type || "string",
+        description: p.description || "",
+      };
+
+      if (p.required) {
+        required.push(p.name);
+      }
+    }
+
+    return {
+      type: "object",
+      properties,
+      ...(required.length > 0 ? { required } : {}),
+    };
+  }
+
+  // Possibly Rube-style: {schema: {...}}
+  if (schema?.properties || schema?.type) {
+    return schema;
+  }
+
+  return schema;
+}
+
+// -------------------------
 export async function OPTIONS() {
   return NextResponse.json({}, { headers: corsHeaders });
 }
@@ -33,7 +78,7 @@ export async function POST(req: Request) {
     }
 
     // -------------------------
-    // 🔐 Validate connection & ownership
+    // 🔐 Validate Connection Ownership
     // -------------------------
     const { data: conn, error: connErr } = await supabase
       .from("va_mcp_connections")
@@ -70,14 +115,14 @@ export async function POST(req: Request) {
     let json: any = null;
 
     // -------------------------
-    // 🟢 CASE 1: SSE STREAM
+    // 🟢 CASE 1 — SSE STREAM
     // -------------------------
     if (contentType.includes("text/event-stream")) {
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
 
       let buffer = "";
-      let lastJSON = null;
+      let finalJSON = null;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -86,70 +131,72 @@ export async function POST(req: Request) {
         buffer += decoder.decode(value, { stream: true });
 
         const lines = buffer.split("\n");
-        buffer = lines.pop()!; // keep partial line for next iteration
+        buffer = lines.pop()!;
 
         for (const line of lines) {
-          if (line.startsWith("data:")) {
-            const raw = line.replace("data:", "").trim();
+          if (!line.startsWith("data:")) continue;
 
-            try {
-              const parsed = JSON.parse(raw);
-              lastJSON = parsed; // keep updating with the newest event
-            } catch {
-              // ignore partial JSON chunks
-            }
+          const raw = line.replace("data:", "").trim();
+          try {
+            const parsed = JSON.parse(raw);
+            finalJSON = parsed; // last event usually contains the full MCP response
+          } catch {
+            // ignore incomplete chunks
           }
         }
       }
 
-      if (!lastJSON) {
+      if (!finalJSON) {
         return NextResponse.json(
           { success: false, error: "Failed to parse SSE response" },
           { status: 500, headers: corsHeaders }
         );
       }
 
-      json = lastJSON;
+      json = finalJSON;
     }
 
     // -------------------------
-    // 🔵 CASE 2: Normal JSON
+    // 🔵 CASE 2 — Standard JSON
     // -------------------------
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
     }
 
     // -------------------------
-    // 🔴 CASE 3: Unknown format
+    // 🔴 CASE 3 — Unknown Format
     // -------------------------
     else {
-      const raw = await response.text();
       return NextResponse.json(
         {
           success: false,
           error: "Unknown response format from MCP server",
-          raw,
+          raw: await response.text(),
         },
         { status: 500, headers: corsHeaders }
       );
     }
 
     // -------------------------
-    // ❌ HTTP error response from MCP
+    // ❌ MCP Returned Error
     // -------------------------
     if (!response.ok) {
       return NextResponse.json(
-        { success: false, error: `HTTP ${response.status}`, response: json },
+        {
+          success: false,
+          error: `HTTP ${response.status}`,
+          response: json,
+        },
         { headers: corsHeaders }
       );
     }
 
     // -------------------------
     // 🧠 INTELLIGENT TOOL EXTRACTION
-    // Handles:
-    //   - result.tools
-    //   - result (array)
-    //   - Plain tools array
+    // Supports:
+    //   Rube: json.result.tools
+    //   Composio: json.tools
+    //   Generic MCP: json.result
     // -------------------------
     const tools =
       json?.result?.tools ??
@@ -159,36 +206,39 @@ export async function POST(req: Request) {
 
     if (!Array.isArray(tools)) {
       return NextResponse.json(
-        {
-          success: false,
-          error: "Invalid tool response format",
-          raw: json,
-        },
+        { success: false, error: "Invalid tool response format", raw: json },
         { status: 500, headers: corsHeaders }
       );
     }
 
     // -------------------------
-    // 📝 Prepare upsert payload
+    // 📝 Normalize & Prepare Upsert Payload
     // -------------------------
-    const upsertPayload = tools.map((tool: any) => ({
-      connection_id,
-      user_id,
-      tool_name: tool.name,
-      description: tool.description ?? "",
-      parameters_schema: tool.inputSchema ?? tool.input_schema ?? {},
-      is_enabled: true,
-    }));
+    const upsertPayload = tools.map((tool: any) => {
+      const schema =
+        tool.inputSchema ??
+        tool.input_schema ??
+        tool.schema ??
+        tool.parameters ??
+        {};
+
+      return {
+        connection_id,
+        user_id,
+        tool_name: tool.name,
+        description: tool.description ?? "",
+        parameters_schema: normalizeSchema(schema),
+        is_enabled: true,
+      };
+    });
 
     // -------------------------
-    // 💾 Save tools in DB
+    // 💾 Save Tools to Supabase
     // -------------------------
     if (upsertPayload.length > 0) {
       const { error: upErr } = await supabase
         .from("va_mcp_tools")
-        .upsert(upsertPayload, {
-          onConflict: "connection_id,tool_name",
-        });
+        .upsert(upsertPayload, { onConflict: "connection_id,tool_name" });
 
       if (upErr) {
         return NextResponse.json(
@@ -202,18 +252,12 @@ export async function POST(req: Request) {
     // 🎉 SUCCESS
     // -------------------------
     return NextResponse.json(
-      {
-        success: true,
-        tools,
-      },
+      { success: true, tools },
       { headers: corsHeaders }
     );
   } catch (e: any) {
     return NextResponse.json(
-      {
-        success: false,
-        error: e.message || "Unexpected server error",
-      },
+      { success: false, error: e.message || "Unexpected server error" },
       { status: 500, headers: corsHeaders }
     );
   }
