@@ -29,9 +29,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // ---------------------------
-    // 🔐 VALIDATE CONNECTION BELONGS TO USER
-    // ---------------------------
+    // Validate owner
     const { data: conn, error: connErr } = await supabase
       .from("va_mcp_connections")
       .select("*")
@@ -46,9 +44,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // ---------------------------
-    // 🔗 CALL THE MCP SERVER
-    // ---------------------------
+    // -----------------------------
+    // 🔗 CALL MCP SERVER
+    // -----------------------------
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
@@ -63,33 +61,99 @@ export async function POST(req: Request) {
       })
     });
 
-    const json = await response.json().catch(() => null);
+    // Detect response content-type
+    const contentType = response.headers.get("content-type") || "";
 
+    let json: any = null;
+
+    // ---------------------------------------
+    // 🟢 CASE 1 — SSE STREAM ("text/event-stream")
+    // ---------------------------------------
+    if (contentType.includes("text/event-stream")) {
+      const reader = response.body!.getReader();
+      let sseText = "";
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        sseText += decoder.decode(value);
+      }
+
+      // SSE format: lines starting with "data:"
+      const dataLines = sseText
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.replace("data:", "").trim());
+
+      // Parse last event (typically final JSON)
+      if (dataLines.length > 0) {
+        const last = dataLines[dataLines.length - 1];
+        try {
+          json = JSON.parse(last);
+        } catch {
+          json = null;
+        }
+      }
+
+      if (!json) {
+        return NextResponse.json(
+          { success: false, error: "Failed to parse SSE JSON", raw: sseText },
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    // ---------------------------------------
+    // 🔵 CASE 2 — Normal JSON response
+    // ---------------------------------------
+    else if (contentType.includes("application/json")) {
+      json = await response.json().catch(() => null);
+    }
+
+    // ---------------------------------------
+    // 🔴 UNKNOWN FORMAT
+    // ---------------------------------------
+    else {
+      const raw = await response.text();
+      return NextResponse.json(
+        { success: false, error: "Unknown response format", raw },
+        { status: 500, headers: corsHeaders }
+      );
+    }
+
+    // If MCP returned non-OK HTTP
     if (!response.ok) {
       return NextResponse.json(
-        { 
-          success: false, 
-          error: `HTTP ${response.status}`, 
-          response: json 
-        },
+        { success: false, error: `HTTP ${response.status}`, response: json },
         { headers: corsHeaders }
       );
     }
 
-    const tools = json?.result?.tools ?? [];
+    // ---------------------------------------
+    // 🧠 INTELLIGENT TOOL EXTRACTION
+    // Supports:
+    //   result.tools  (standard MCP)
+    //   result        (array)
+    //   SSE-derived events
+    // ---------------------------------------
+    const tools =
+      json?.result?.tools ??
+      json?.result ??
+      [];
 
-    // ---------------------------
-    // 📝 UPSERT TOOLS INTO Supabase
-    // ---------------------------
+    // Normalize every tool
     const upsertPayload = tools.map((tool: any) => ({
       connection_id,
-      user_id, // REQUIRED
+      user_id,
       tool_name: tool.name,
       description: tool.description ?? "",
-      parameters_schema: tool.inputSchema ?? {},
+      parameters_schema:
+        tool.inputSchema ?? tool.input_schema ?? {},
       is_enabled: true
     }));
 
+    // Save to DB
     if (upsertPayload.length > 0) {
       const { error: upErr } = await supabase
         .from("va_mcp_tools")
@@ -99,11 +163,7 @@ export async function POST(req: Request) {
 
       if (upErr) {
         return NextResponse.json(
-          { 
-            success: false, 
-            error: "Failed saving tools",
-            details: upErr.message 
-          },
+          { success: false, error: upErr.message },
           { status: 500, headers: corsHeaders }
         );
       }
