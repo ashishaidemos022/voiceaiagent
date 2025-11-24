@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { corsHeaders } from "@/lib/cors";
-import { normalizeMCPArguments } from "@/lib/mcp-normalizer"; // your universal tool normalizer
+import { normalizeMCPArguments } from "@/lib/mcp-normalizer"; // universal normalizer
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -30,7 +30,7 @@ export async function POST(req: Request) {
     }
 
     // ------------------------------------
-    // 2. Validate connection belongs to user
+    // 2. Validate user connection
     // ------------------------------------
     const { data: conn } = await supabase
       .from("va_mcp_connections")
@@ -50,7 +50,7 @@ export async function POST(req: Request) {
     }
 
     // ------------------------------------
-    // 3. Load tool schema
+    // 3. Load tool schema (supports Rube, Gmail, OpenAI, any MCP)
     // ------------------------------------
     const { data: toolRecord } = await supabase
       .from("va_mcp_tools")
@@ -61,18 +61,27 @@ export async function POST(req: Request) {
       .single();
 
     const inputSchema =
-      toolRecord?.parameters_schema && Object.keys(toolRecord.parameters_schema).length > 0
+      toolRecord?.parameters_schema &&
+      typeof toolRecord.parameters_schema === "object" &&
+      Object.keys(toolRecord.parameters_schema).length > 0
         ? toolRecord.parameters_schema
         : null;
 
     // ------------------------------------
-    // 4. Normalize arguments using the universal MCP normalizer
+    // 4. Normalize Arguments (all normalizer versions supported)
     // ------------------------------------
-    const { normalized, missingRequired } = normalizeMCPArguments({
+    const norm = normalizeMCPArguments({
       toolName: tool_name,
       rawArgs: parameters || {},
       schema: inputSchema
     });
+
+    const normalized = norm.normalized ?? {};
+    const missingRequired =
+      norm.missingRequired ??
+      norm.missing ??
+      norm.requiredMissing ??
+      [];
 
     if (missingRequired.length > 0) {
       return NextResponse.json(
@@ -87,7 +96,7 @@ export async function POST(req: Request) {
     }
 
     // ------------------------------------
-    // 5. Execute via MCP server (HTTPS JSON-RPC)
+    // 5. Build JSON-RPC request
     // ------------------------------------
     const rpcBody = {
       jsonrpc: "2.0",
@@ -99,6 +108,9 @@ export async function POST(req: Request) {
       }
     };
 
+    // ------------------------------------
+    // 6. Send request to MCP server
+    // ------------------------------------
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
@@ -113,11 +125,12 @@ export async function POST(req: Request) {
     let json: any = null;
 
     // ------------------------------------
-    // 6. SSE Handling
+    // 7. SSE stream parsing (Rube uses SSE)
     // ------------------------------------
     if (contentType.includes("text/event-stream")) {
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
+
       let buffer = "";
       let lastJSON = null;
 
@@ -125,29 +138,36 @@ export async function POST(req: Request) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value);
+        buffer += decoder.decode(value, { stream: true });
+
         const lines = buffer.split("\n");
-        buffer = lines.pop()!;
+        buffer = lines.pop()!; // keep incomplete last line
 
         for (const line of lines) {
           if (line.startsWith("data:")) {
             const raw = line.replace("data:", "").trim();
             try {
               lastJSON = JSON.parse(raw);
-            } catch {}
+            } catch {
+              // ignore invalid partials
+            }
           }
         }
       }
-
       json = lastJSON ?? {};
     }
 
     // ------------------------------------
-    // 7. JSON handling
+    // 8. JSON fallback
     // ------------------------------------
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
-    } else {
+    }
+
+    // ------------------------------------
+    // 9. Unknown response format
+    // ------------------------------------
+    else {
       return NextResponse.json(
         {
           success: false,
@@ -157,7 +177,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // MCP Request failed
+    // ------------------------------------
+    // 10. MCP returned HTTP error
+    // ------------------------------------
     if (!response.ok) {
       return NextResponse.json(
         {
@@ -170,24 +192,23 @@ export async function POST(req: Request) {
     }
 
     // ------------------------------------
-    // 8. Normalize Rube multi-tool responses
+    // 11. Auto-normalize Rube Multi-Execute results
     // ------------------------------------
     let resultPayload = json?.result ?? json;
-
-    const isRubeMultiTool =
+    const isRubeMulti =
       tool_name === "RUBE_MULTI_EXECUTE_TOOL" &&
       resultPayload?.data?.data?.results;
 
-    if (isRubeMultiTool) {
+    if (isRubeMulti) {
       resultPayload = {
         results: resultPayload.data.data.results,
-        time_info: resultPayload.data.data.time_info,
-        memory: resultPayload.data.data.memory
+        memory: resultPayload.data.data.memory,
+        time_info: resultPayload.data.data.time_info
       };
     }
 
     // ------------------------------------
-    // 9. Save execution log (optional)
+    // 12. Save execution log
     // ------------------------------------
     await supabase.from("va_mcp_logs").insert({
       user_id,
@@ -199,7 +220,7 @@ export async function POST(req: Request) {
     });
 
     // ------------------------------------
-    // 10. Final success response
+    // 13. Final Return
     // ------------------------------------
     return NextResponse.json(
       {
