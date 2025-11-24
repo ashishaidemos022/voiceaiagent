@@ -15,6 +15,9 @@ export async function POST(req: Request) {
   try {
     const { connection_id, user_id } = await req.json();
 
+    // -------------------------
+    // 🔐 Validate Inputs
+    // -------------------------
     if (!user_id) {
       return NextResponse.json(
         { success: false, error: "Missing user_id" },
@@ -29,7 +32,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // Validate owner
+    // -------------------------
+    // 🔐 Validate connection & ownership
+    // -------------------------
     const { data: conn, error: connErr } = await supabase
       .from("va_mcp_connections")
       .select("*")
@@ -44,85 +49,94 @@ export async function POST(req: Request) {
       );
     }
 
-    // -----------------------------
+    // -------------------------
     // 🔗 CALL MCP SERVER
-    // -----------------------------
+    // -------------------------
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
+        Accept: "application/json, text/event-stream",
+        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "tools-list",
-        method: "tools/list"
-      })
+        method: "tools/list",
+      }),
     });
 
-    // Detect response content-type
     const contentType = response.headers.get("content-type") || "";
-
     let json: any = null;
 
-    // ---------------------------------------
-    // 🟢 CASE 1 — SSE STREAM ("text/event-stream")
-    // ---------------------------------------
+    // -------------------------
+    // 🟢 CASE 1: SSE STREAM
+    // -------------------------
     if (contentType.includes("text/event-stream")) {
       const reader = response.body!.getReader();
-      let sseText = "";
       const decoder = new TextDecoder();
+
+      let buffer = "";
+      let lastJSON = null;
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        sseText += decoder.decode(value);
-      }
 
-      // SSE format: lines starting with "data:"
-      const dataLines = sseText
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.replace("data:", "").trim());
+        buffer += decoder.decode(value, { stream: true });
 
-      // Parse last event (typically final JSON)
-      if (dataLines.length > 0) {
-        const last = dataLines[dataLines.length - 1];
-        try {
-          json = JSON.parse(last);
-        } catch {
-          json = null;
+        const lines = buffer.split("\n");
+        buffer = lines.pop()!; // keep partial line for next iteration
+
+        for (const line of lines) {
+          if (line.startsWith("data:")) {
+            const raw = line.replace("data:", "").trim();
+
+            try {
+              const parsed = JSON.parse(raw);
+              lastJSON = parsed; // keep updating with the newest event
+            } catch {
+              // ignore partial JSON chunks
+            }
+          }
         }
       }
 
-      if (!json) {
+      if (!lastJSON) {
         return NextResponse.json(
-          { success: false, error: "Failed to parse SSE JSON", raw: sseText },
+          { success: false, error: "Failed to parse SSE response" },
           { status: 500, headers: corsHeaders }
         );
       }
+
+      json = lastJSON;
     }
 
-    // ---------------------------------------
-    // 🔵 CASE 2 — Normal JSON response
-    // ---------------------------------------
+    // -------------------------
+    // 🔵 CASE 2: Normal JSON
+    // -------------------------
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
     }
 
-    // ---------------------------------------
-    // 🔴 UNKNOWN FORMAT
-    // ---------------------------------------
+    // -------------------------
+    // 🔴 CASE 3: Unknown format
+    // -------------------------
     else {
       const raw = await response.text();
       return NextResponse.json(
-        { success: false, error: "Unknown response format", raw },
+        {
+          success: false,
+          error: "Unknown response format from MCP server",
+          raw,
+        },
         { status: 500, headers: corsHeaders }
       );
     }
 
-    // If MCP returned non-OK HTTP
+    // -------------------------
+    // ❌ HTTP error response from MCP
+    // -------------------------
     if (!response.ok) {
       return NextResponse.json(
         { success: false, error: `HTTP ${response.status}`, response: json },
@@ -130,35 +144,50 @@ export async function POST(req: Request) {
       );
     }
 
-    // ---------------------------------------
+    // -------------------------
     // 🧠 INTELLIGENT TOOL EXTRACTION
-    // Supports:
-    //   result.tools  (standard MCP)
-    //   result        (array)
-    //   SSE-derived events
-    // ---------------------------------------
+    // Handles:
+    //   - result.tools
+    //   - result (array)
+    //   - Plain tools array
+    // -------------------------
     const tools =
       json?.result?.tools ??
       json?.result ??
+      json?.tools ??
       [];
 
-    // Normalize every tool
+    if (!Array.isArray(tools)) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Invalid tool response format",
+          raw: json,
+        },
+        { status: 500, headers: corsHeaders }
+      );
+    }
+
+    // -------------------------
+    // 📝 Prepare upsert payload
+    // -------------------------
     const upsertPayload = tools.map((tool: any) => ({
       connection_id,
       user_id,
       tool_name: tool.name,
       description: tool.description ?? "",
-      parameters_schema:
-        tool.inputSchema ?? tool.input_schema ?? {},
-      is_enabled: true
+      parameters_schema: tool.inputSchema ?? tool.input_schema ?? {},
+      is_enabled: true,
     }));
 
-    // Save to DB
+    // -------------------------
+    // 💾 Save tools in DB
+    // -------------------------
     if (upsertPayload.length > 0) {
       const { error: upErr } = await supabase
         .from("va_mcp_tools")
         .upsert(upsertPayload, {
-          onConflict: "connection_id,tool_name"
+          onConflict: "connection_id,tool_name",
         });
 
       if (upErr) {
@@ -169,14 +198,22 @@ export async function POST(req: Request) {
       }
     }
 
+    // -------------------------
+    // 🎉 SUCCESS
+    // -------------------------
     return NextResponse.json(
-      { success: true, tools },
+      {
+        success: true,
+        tools,
+      },
       { headers: corsHeaders }
     );
-
   } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: e.message },
+      {
+        success: false,
+        error: e.message || "Unexpected server error",
+      },
       { status: 500, headers: corsHeaders }
     );
   }
