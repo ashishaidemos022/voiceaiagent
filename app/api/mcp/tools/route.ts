@@ -7,35 +7,37 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// ----------------------------
-// Schema Normalizer
-// ----------------------------
+/* ----------------------------------------------------
+   Schema Normalizer — Converts ANY schema into JSONSchema
+---------------------------------------------------- */
 function normalizeSchema(schema: any): any {
   if (!schema) return {};
 
-  // Already JSON schema
-  if (schema.type === "object" && schema.properties) {
-    return schema;
-  }
+  // Already a JSON schema
+  if (schema.type === "object" && schema.properties) return schema;
 
-  // Array → JSON Schema
+  // Rube sometimes returns array-based schema
   if (Array.isArray(schema)) {
     const properties: Record<string, any> = {};
     const required: string[] = [];
 
     for (const p of schema) {
       if (!p?.name) continue;
-      properties[p.name] = { type: p.type || "string", description: p.description || "" };
+      properties[p.name] = {
+        type: p.type || "string",
+        description: p.description || "",
+      };
       if (p.required) required.push(p.name);
     }
 
     return {
       type: "object",
       properties,
-      ...(required.length > 0 ? { required } : {})
+      ...(required.length > 0 ? { required } : {}),
     };
   }
 
+  // Fallback passthrough
   return schema;
 }
 
@@ -47,14 +49,22 @@ export async function POST(req: Request) {
   try {
     const { connection_id, user_id } = await req.json();
 
+    /* ----------------------------------------------------
+       Validate Inputs
+    ---------------------------------------------------- */
     if (!connection_id || !user_id) {
       return NextResponse.json(
-        { success: false, error: "Missing connection_id or user_id" },
+        {
+          success: false,
+          error: "Missing required fields: connection_id, user_id",
+        },
         { status: 400, headers: corsHeaders }
       );
     }
 
-    // Validate connection belongs to user
+    /* ----------------------------------------------------
+       Validate Connection Ownership
+    ---------------------------------------------------- */
     const { data: conn } = await supabase
       .from("va_mcp_connections")
       .select("*")
@@ -64,52 +74,60 @@ export async function POST(req: Request) {
 
     if (!conn) {
       return NextResponse.json(
-        { success: false, error: "Connection not found or unauthorized" },
+        {
+          success: false,
+          error: "Connection not found or unauthorized",
+        },
         { status: 404, headers: corsHeaders }
       );
     }
 
-    // Call MCP server
+    /* ----------------------------------------------------
+       Call MCP Server → tools/list
+    ---------------------------------------------------- */
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
+        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "tools-list",
-        method: "tools/list"
-      })
+        method: "tools/list",
+      }),
     });
 
     const contentType = response.headers.get("content-type") || "";
     let json: any = null;
 
-    // ----------------------------
-    // SSE Parsing
-    // ----------------------------
+    /* ----------------------------------------------------
+       Handle SSE Stream
+    ---------------------------------------------------- */
     if (contentType.includes("text/event-stream")) {
       const reader = response.body!.getReader();
-      let buf = "";
       const decoder = new TextDecoder();
-      let lastJSON = null;
+
+      let buffer = "";
+      let lastJSON: any = null;
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        buf += decoder.decode(value);
-        const lines = buf.split("\n");
-        buf = lines.pop()!;
+        buffer += decoder.decode(value);
+        const lines = buffer.split("\n");
+        buffer = lines.pop()!;
 
         for (const line of lines) {
           if (line.startsWith("data:")) {
             const raw = line.replace("data:", "").trim();
             try {
               lastJSON = JSON.parse(raw);
-            } catch {}
+            } catch {
+              /* ignore */
+            }
           }
         }
       }
@@ -117,23 +135,33 @@ export async function POST(req: Request) {
       json = lastJSON ?? {};
     }
 
-    // ----------------------------
-    // Normal JSON
-    // ----------------------------
+    /* ----------------------------------------------------
+       Handle JSON
+    ---------------------------------------------------- */
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
-    } else {
+    }
+
+    /* ----------------------------------------------------
+       Unknown Format
+    ---------------------------------------------------- */
+    else {
       return NextResponse.json(
-        { success: false, error: "Unknown response format" },
+        {
+          success: false,
+          error: "Unknown response format from MCP server",
+        },
         { status: 500, headers: corsHeaders }
       );
     }
 
-    // ----------------------------
-    // RUBE SCHEMA EXTRACTION (CRITICAL)
-    // ----------------------------
+    /* ----------------------------------------------------
+       Extract Rube tool_schemas when present
+       (Critical for Gmail, Slack, Google Drive, etc.)
+    ---------------------------------------------------- */
     const rubeSchemas =
-      json?.data?.data?.tool_schemas ??
+      json?.data?.data?.tool_schemas ||
+      json?.result?.data?.tool_schemas ||
       null;
 
     let tools: any[] = [];
@@ -142,11 +170,13 @@ export async function POST(req: Request) {
       tools = Object.values(rubeSchemas).map((tool: any) => ({
         name: tool.tool_slug,
         description: tool.description || "",
-        parameters_schema: tool.input_schema || {},
+        parameters_schema: tool.input_schema || tool.inputSchema || {},
       }));
     }
 
-    // Fallback for generic MCP servers
+    /* ----------------------------------------------------
+       Fallback for normal MCP servers (OpenAI, Anthropic)
+    ---------------------------------------------------- */
     if (tools.length === 0) {
       tools =
         json?.result?.tools ??
@@ -157,14 +187,18 @@ export async function POST(req: Request) {
 
     if (!Array.isArray(tools)) {
       return NextResponse.json(
-        { success: false, error: "Invalid tools format", raw: json },
+        {
+          success: false,
+          error: "Invalid tool response format",
+          raw: json,
+        },
         { status: 500, headers: corsHeaders }
       );
     }
 
-    // ----------------------------
-    // Normalize schemas & upsert
-    // ----------------------------
+    /* ----------------------------------------------------
+       Normalize Schema + Upsert to Supabase
+    ---------------------------------------------------- */
     const upsertPayload = tools.map((tool: any) => ({
       connection_id,
       user_id,
@@ -189,13 +223,22 @@ export async function POST(req: Request) {
       }
     }
 
+    /* ----------------------------------------------------
+       SUCCESS
+    ---------------------------------------------------- */
     return NextResponse.json(
-      { success: true, tools },
+      {
+        success: true,
+        tools,
+      },
       { headers: corsHeaders }
     );
   } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: e.message },
+      {
+        success: false,
+        error: e.message || "Unexpected server error",
+      },
       { status: 500, headers: corsHeaders }
     );
   }
