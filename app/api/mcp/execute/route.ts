@@ -1,9 +1,7 @@
-// app/api/mcp/execute/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { corsHeaders } from "@/lib/cors";
-import { normalizeMCPArguments } from "@/lib/mcp-normalizer";
-import { MCPToolDefinition } from "@/lib/mcp-normalizer";
+import { normalizeMCPArguments } from "@/lib/mcp-normalizer"; // Your final normalizer
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -18,16 +16,22 @@ export async function POST(req: Request) {
   try {
     const { connection_id, tool_name, parameters, user_id } = await req.json();
 
+    /* ----------------------------------------------------
+       1. Validate required fields
+    ---------------------------------------------------- */
     if (!connection_id || !tool_name || !user_id) {
       return NextResponse.json(
-        { success: false, error: "Missing connection_id, tool_name, or user_id" },
+        {
+          success: false,
+          error: "Missing required fields: connection_id, tool_name, user_id",
+        },
         { status: 400, headers: corsHeaders }
       );
     }
 
-    // ------------------------------------------------
-    // 1. Validate connection
-    // ------------------------------------------------
+    /* ----------------------------------------------------
+       2. Validate connection belongs to the user
+    ---------------------------------------------------- */
     const { data: conn } = await supabase
       .from("va_mcp_connections")
       .select("*")
@@ -42,9 +46,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // ------------------------------------------------
-    // 2. Load tool metadata
-    // ------------------------------------------------
+    /* ----------------------------------------------------
+       3. Load tool schema from Supabase
+    ---------------------------------------------------- */
     const { data: toolRecord } = await supabase
       .from("va_mcp_tools")
       .select("*")
@@ -57,83 +61,62 @@ export async function POST(req: Request) {
       toolRecord?.parameters_schema &&
       Object.keys(toolRecord.parameters_schema).length > 0
         ? toolRecord.parameters_schema
-        : undefined;
+        : null;
 
-    // ------------------------------------------------
-    // 3. Prepare MCPToolDefinition object
-    // ------------------------------------------------
-    const toolDef: MCPToolDefinition = {
-      name: tool_name,
-      inputSchema,
-      input_schema: inputSchema
-    };
-
-    // ------------------------------------------------
-    // 4. Normalize arguments using your universal normalizer
-    // ------------------------------------------------
-    const { normalized, logs } = normalizeMCPArguments(
-      toolDef,
+    /* ----------------------------------------------------
+       4. Normalize arguments via universal normalizer
+          (Your newest version: normalizeMCPArguments(tool, args))
+    ---------------------------------------------------- */
+    const norm = normalizeMCPArguments(
+      {
+        name: tool_name,
+        inputSchema,
+        input_schema: inputSchema,
+      },
       parameters || {}
     );
 
-    // Determine missing required fields
-    const requiredFields =
-      (inputSchema && Array.isArray(inputSchema.required)
-        ? inputSchema.required
-        : []) || [];
+    const normalized = norm.normalized;
+    const logs = norm.logs;
 
-    const missingRequired = requiredFields.filter(
-      (field: string) => normalized[field] == null
-    );
-
-    if (missingRequired.length > 0) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: `Missing required fields: ${missingRequired.join(", ")}`,
-          normalized,
-          logs
-        },
-        { status: 400, headers: corsHeaders }
-      );
-    }
-
-    // ------------------------------------------------
-    // 5. Build MCP JSON-RPC call
-    // ------------------------------------------------
+    /* ----------------------------------------------------
+       5. Build JSON-RPC request body
+    ---------------------------------------------------- */
     const rpcBody = {
       jsonrpc: "2.0",
       id: `exec-${Date.now()}`,
       method: "tools/call",
       params: {
         name: tool_name,
-        arguments: normalized
-      }
+        arguments: normalized,
+      },
     };
 
-    // ------------------------------------------------
-    // 6. Execute request (SSE-aware)
-    // ------------------------------------------------
+    /* ----------------------------------------------------
+       6. Call MCP server over JSON-RPC
+    ---------------------------------------------------- */
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
+        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
-      body: JSON.stringify(rpcBody)
+      body: JSON.stringify(rpcBody),
     });
 
     const contentType = response.headers.get("content-type") || "";
     let json: any = null;
 
-    // ---- SSE ----
+    /* ----------------------------------------------------
+       7. Handle SSE (Rube uses SSE for multi-step tools)
+    ---------------------------------------------------- */
     if (contentType.includes("text/event-stream")) {
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
 
       let buffer = "";
-      let lastJSON = null;
+      let lastJSON: any = null;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -145,9 +128,12 @@ export async function POST(req: Request) {
 
         for (const line of lines) {
           if (line.startsWith("data:")) {
+            const raw = line.replace("data:", "").trim();
             try {
-              lastJSON = JSON.parse(line.replace("data:", "").trim());
-            } catch {}
+              lastJSON = JSON.parse(raw);
+            } catch {
+              /* ignore partial chunks */
+            }
           }
         }
       }
@@ -155,75 +141,76 @@ export async function POST(req: Request) {
       json = lastJSON ?? {};
     }
 
-    // ---- JSON ----
+    /* ----------------------------------------------------
+       8. Handle normal JSON-RPC responses
+    ---------------------------------------------------- */
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
-    }
-
-    else {
+    } else {
       return NextResponse.json(
-        { success: false, error: "Unknown MCP response format" },
+        { success: false, error: "Unknown response format" },
         { status: 500, headers: corsHeaders }
       );
     }
 
+    /* ----------------------------------------------------
+       9. Error from MCP server
+    ---------------------------------------------------- */
     if (!response.ok) {
       return NextResponse.json(
-        {
-          success: false,
-          error: `HTTP ${response.status}`,
-          normalized,
-          response: json
-        },
+        { success: false, error: `HTTP ${response.status}`, response: json },
         { headers: corsHeaders }
       );
     }
 
-    // ------------------------------------------------
-    // 7. Rube-style multi-tool response normalization
-    // ------------------------------------------------
-    let result = json?.result ?? json;
+    /* ----------------------------------------------------
+       10. Rube multi-tool normalization
+           Detect: RUBE_MULTI_EXECUTE_TOOL
+    ---------------------------------------------------- */
+    let resultPayload = json?.result ?? json;
 
     const isRubeMulti =
       tool_name === "RUBE_MULTI_EXECUTE_TOOL" &&
-      result?.data?.data?.results;
+      resultPayload?.data?.data?.results;
 
     if (isRubeMulti) {
-      result = {
-        results: result.data.data.results,
-        memory: result.data.data.memory ?? {},
-        time_info: result.data.data.time_info ?? {}
+      resultPayload = {
+        results: resultPayload.data.data.results,
+        session: resultPayload.data.data.session,
+        time_info: resultPayload.data.data.time_info,
+        memory: resultPayload.data.data.memory,
       };
     }
 
-    // ------------------------------------------------
-    // 8. Save execution log
-    // ------------------------------------------------
+    /* ----------------------------------------------------
+       11. Save execution log
+    ---------------------------------------------------- */
     await supabase.from("va_mcp_logs").insert({
       user_id,
       connection_id,
       tool_name,
       raw_request: rpcBody,
       normalized_request: normalized,
-      raw_response: result
+      raw_response: resultPayload,
+      normalization_logs: logs,
     });
 
-    // ------------------------------------------------
-    // 9. Done
-    // ------------------------------------------------
+    /* ----------------------------------------------------
+       12. Success
+    ---------------------------------------------------- */
     return NextResponse.json(
       {
         success: true,
         tool: tool_name,
         normalized_args: normalized,
-        logs,
-        result
+        normalization_logs: logs,
+        result: resultPayload,
       },
       { headers: corsHeaders }
     );
-  } catch (err: any) {
+  } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: err.message || "Server error during MCP execution" },
+      { success: false, error: e.message || "Unexpected server error" },
       { status: 500, headers: corsHeaders }
     );
   }
