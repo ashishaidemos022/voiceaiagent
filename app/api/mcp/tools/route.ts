@@ -8,17 +8,17 @@ const supabase = createClient(
 );
 
 // -----------------------------------------------
-// Robust Schema Normalizer (Rube → JSON Schema)
+// Robust Schema Normalizer
 // -----------------------------------------------
 function normalizeSchema(input: any): any {
   if (!input) return { type: "object", properties: {} };
 
-  // If already valid JSON schema:
+  // Already JSON Schema-ish
   if (input.type === "object" && input.properties) {
     return input;
   }
 
-  // If input_schema is an array of fields:
+  // Rube-style array of fields
   if (Array.isArray(input)) {
     const properties: Record<string, any> = {};
     const required: string[] = [];
@@ -41,7 +41,7 @@ function normalizeSchema(input: any): any {
     };
   }
 
-  // If Rube gives nested structures
+  // Generic object – trust it
   if (typeof input === "object" && Object.keys(input).length > 0) {
     return input;
   }
@@ -67,16 +67,16 @@ export async function POST(req: Request) {
     // -------------------------------------------------
     // Validate connection belongs to user
     // -------------------------------------------------
-    const { data: conn, error: connError } = await supabase
+    const { data: conn, error: connErr } = await supabase
       .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
       .eq("user_id", user_id)
       .single();
 
-    if (connError) {
+    if (connErr) {
       return NextResponse.json(
-        { success: false, error: connError.message },
+        { success: false, error: connErr.message },
         { status: 500, headers: corsHeaders }
       );
     }
@@ -89,22 +89,15 @@ export async function POST(req: Request) {
     }
 
     // -------------------------------------------------
-    // MCP Session Id handling
+    // Ensure Mcp-Session-Id (create if missing)
     // -------------------------------------------------
-    // Headers are case-insensitive, but we'll check both common variants.
-    let sessionId =
-      req.headers.get("mcp-session-id") ||
-      req.headers.get("Mcp-Session-Id") ||
-      null;
+    const incomingHeaders = req.headers;
+    const incomingSessionId =
+      incomingHeaders.get("Mcp-Session-Id") ||
+      incomingHeaders.get("mcp-session-id") ||
+      undefined;
 
-    if (!sessionId) {
-      try {
-        sessionId = crypto.randomUUID();
-      } catch {
-        // Fallback if crypto.randomUUID() isn't available
-        sessionId = `${connection_id}-session`;
-      }
-    }
+    const sessionId = incomingSessionId || crypto.randomUUID();
 
     // -------------------------------------------------
     // Call MCP server (tools/list)
@@ -114,7 +107,7 @@ export async function POST(req: Request) {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        "Mcp-Session-Id": sessionId, // 👈 CRITICAL for Supabase MCP
+        "Mcp-Session-Id": sessionId,
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
       },
       body: JSON.stringify({
@@ -128,10 +121,10 @@ export async function POST(req: Request) {
     let json: any = null;
 
     // -------------------------------------------------
-    // Parse SSE stream (if MCP sends event-stream)
+    // Parse SSE stream (if MCP streams tools)
     // -------------------------------------------------
-    if (contentType.includes("text/event-stream") && response.body) {
-      const reader = response.body.getReader();
+    if (contentType.includes("text/event-stream")) {
+      const reader = response.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let lastJSON: any = null;
@@ -161,76 +154,108 @@ export async function POST(req: Request) {
     }
 
     // -------------------------------------------------
-    // Parse normal JSON
+    // Or parse regular JSON
     // -------------------------------------------------
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
     }
 
-    // If upstream returned non-200, surface error but include raw JSON
-    if (!response.ok) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: `HTTP ${response.status}`,
-          response: json,
-          mcp_session_id: sessionId
-        },
-        { status: 200, headers: corsHeaders }
-      );
-    }
-
     if (!json) {
       return NextResponse.json(
-        {
-          success: false,
-          error: "MCP server returned empty response",
-          mcp_session_id: sessionId
-        },
+        { success: false, error: "MCP server returned empty response" },
         { status: 500, headers: corsHeaders }
       );
     }
 
+    // Optional: log raw for debugging in Vercel
+    console.log("MCP tools raw response:", JSON.stringify(json, null, 2));
+
     // -------------------------------------------------
-    // Extract Rube schemas
+    // Extract tools for different MCP server flavours
     // -------------------------------------------------
+    let tools: any[] = [];
+
+    // 1) Rube-style → tool_schemas
     const rubeSchemas =
       json?.data?.data?.tool_schemas ??
       json?.result?.tool_schemas ??
       null;
 
-    let tools: any[] = [];
-
     if (rubeSchemas && typeof rubeSchemas === "object") {
       tools = Object.values(rubeSchemas).map((tool: any) => ({
-        name: tool.tool_slug,
+        name: tool.tool_slug || tool.name,
         description: tool.description || "",
         parameters_schema: normalizeSchema(
-          tool.input_schema || tool.inputSchema || {}
+          tool.parameters_schema ||
+          tool.input_schema ||
+          tool.inputSchema ||
+          tool.schema ||
+          {}
         )
       }));
     }
 
-    // Fallback: generic MCP servers returning plain tools[]
+    // 2) Generic MCP (Supabase etc.) including object=list, data=[...]
     if (tools.length === 0) {
-      tools = json?.result?.tools ?? json?.result ?? [];
+      const result = json.result ?? json;
+      let rawTools: any = null;
+
+      // Plain array
+      if (Array.isArray(result)) {
+        rawTools = result;
+      }
+      // result.tools
+      else if (Array.isArray(result?.tools)) {
+        rawTools = result.tools;
+      }
+      // result.data.tools
+      else if (Array.isArray(result?.data?.tools)) {
+        rawTools = result.data.tools;
+      }
+      // top-level tools
+      else if (Array.isArray(json.tools)) {
+        rawTools = json.tools;
+      }
+      // Supabase-style: { object: "list", data: [ { object: "tool", ... } ] }
+      else if (result?.object === "list" && Array.isArray(result?.data)) {
+        rawTools = result.data.map((item: any) => {
+          // sometimes tool lives under item.tool, otherwise item itself
+          return item.tool || item;
+        });
+      }
+
+      if (Array.isArray(rawTools)) {
+        tools = rawTools.map((tool: any) => ({
+          name: tool.name,
+          description: tool.description || "",
+          parameters_schema: normalizeSchema(
+            tool.parameters_schema ||
+            tool.parameters ||
+            tool.input_schema ||
+            tool.inputSchema ||
+            tool.schema ||
+            {}
+          )
+        }));
+      }
     }
 
-    if (!Array.isArray(tools)) {
+    if (!Array.isArray(tools) || tools.length === 0) {
       return NextResponse.json(
         {
           success: false,
-          error: "Invalid tools format",
-          raw: json,
-          mcp_session_id: sessionId
+          error: "No tools found in MCP response",
+          raw: json
         },
         { status: 500, headers: corsHeaders }
       );
     }
 
     // -------------------------------------------------
-    // BUILD UPSERT PAYLOAD (Overwrite mode)
+    // Build UPSERT payload (Overwrite mode)
     // -------------------------------------------------
+    const now = new Date().toISOString();
+
     const payload = tools.map((tool: any) => ({
       connection_id,
       user_id,
@@ -238,12 +263,9 @@ export async function POST(req: Request) {
       description: tool.description ?? "",
       parameters_schema: normalizeSchema(tool.parameters_schema),
       is_enabled: true,
-      updated_at: new Date().toISOString()
-    ));
+      updated_at: now
+    }));
 
-    // -------------------------------------------------
-    // Overwrite existing → Upsert with onConflict
-    // -------------------------------------------------
     const { error: upErr } = await supabase
       .from("va_mcp_tools")
       .upsert(payload, {
@@ -252,22 +274,23 @@ export async function POST(req: Request) {
 
     if (upErr) {
       return NextResponse.json(
-        {
-          success: false,
-          error: upErr.message,
-          mcp_session_id: sessionId
-        },
+        { success: false, error: upErr.message },
         { status: 500, headers: corsHeaders }
       );
     }
 
     return NextResponse.json(
-      { success: true, tools, mcp_session_id: sessionId },
+      {
+        success: true,
+        tools,
+        mcp_session_id: sessionId
+      },
       { headers: corsHeaders }
     );
   } catch (e: any) {
+    console.error("MCP tools route error:", e);
     return NextResponse.json(
-      { success: false, error: e.message, mcp_session_id: null },
+      { success: false, error: e.message },
       { status: 500, headers: corsHeaders }
     );
   }
