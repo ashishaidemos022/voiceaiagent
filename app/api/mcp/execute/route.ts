@@ -93,13 +93,25 @@ export async function POST(req: Request) {
     };
 
     /* ----------------------------------------------------
-       6. Call MCP server over JSON-RPC
+       6. Ensure Mcp-Session-Id (read or synthesize)
+    ---------------------------------------------------- */
+    const incomingHeaders = req.headers;
+    const incomingSessionId =
+      incomingHeaders.get("Mcp-Session-Id") ||
+      incomingHeaders.get("mcp-session-id") ||
+      undefined;
+
+    const sessionId = incomingSessionId || crypto.randomUUID();
+
+    /* ----------------------------------------------------
+       7. Call MCP server over JSON-RPC
     ---------------------------------------------------- */
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
+        "Mcp-Session-Id": sessionId,
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
       body: JSON.stringify(rpcBody),
@@ -109,7 +121,7 @@ export async function POST(req: Request) {
     let json: any = null;
 
     /* ----------------------------------------------------
-       7. Handle SSE (Rube uses SSE for multi-step tools)
+       8. Handle SSE (Rube uses SSE for multi-step tools)
     ---------------------------------------------------- */
     if (contentType.includes("text/event-stream")) {
       const reader = response.body!.getReader();
@@ -142,7 +154,7 @@ export async function POST(req: Request) {
     }
 
     /* ----------------------------------------------------
-       8. Handle normal JSON-RPC responses
+       9. Handle normal JSON-RPC responses
     ---------------------------------------------------- */
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
@@ -154,17 +166,22 @@ export async function POST(req: Request) {
     }
 
     /* ----------------------------------------------------
-       9. Error from MCP server
+       10. Error from MCP server
     ---------------------------------------------------- */
     if (!response.ok) {
       return NextResponse.json(
-        { success: false, error: `HTTP ${response.status}`, response: json },
+        {
+          success: false,
+          error: `HTTP ${response.status}`,
+          response: json,
+          mcp_session_id: sessionId,
+        },
         { headers: corsHeaders }
       );
     }
 
     /* ----------------------------------------------------
-       10. Rube multi-tool normalization
+       11. Rube multi-tool normalization
            Detect: RUBE_MULTI_EXECUTE_TOOL
     ---------------------------------------------------- */
     let resultPayload = json?.result ?? json;
@@ -183,7 +200,7 @@ export async function POST(req: Request) {
     }
 
     /* ----------------------------------------------------
-       11. Save execution log
+       12. Save execution log
     ---------------------------------------------------- */
     await supabase.from("va_mcp_logs").insert({
       user_id,
@@ -193,10 +210,11 @@ export async function POST(req: Request) {
       normalized_request: normalized,
       raw_response: resultPayload,
       normalization_logs: logs,
+      mcp_session_id: sessionId,
     });
 
     /* ----------------------------------------------------
-       12. Success
+       13. Success
     ---------------------------------------------------- */
     return NextResponse.json(
       {
@@ -205,6 +223,7 @@ export async function POST(req: Request) {
         normalized_args: normalized,
         normalization_logs: logs,
         result: resultPayload,
+        mcp_session_id: sessionId,
       },
       { headers: corsHeaders }
     );
