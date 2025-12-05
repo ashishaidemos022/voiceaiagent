@@ -67,18 +67,43 @@ export async function POST(req: Request) {
     // -------------------------------------------------
     // Validate connection belongs to user
     // -------------------------------------------------
-    const { data: conn } = await supabase
+    const { data: conn, error: connError } = await supabase
       .from("va_mcp_connections")
       .select("*")
       .eq("id", connection_id)
       .eq("user_id", user_id)
       .single();
 
+    if (connError) {
+      return NextResponse.json(
+        { success: false, error: connError.message },
+        { status: 500, headers: corsHeaders }
+      );
+    }
+
     if (!conn) {
       return NextResponse.json(
         { success: false, error: "Connection not found or unauthorized" },
         { status: 404, headers: corsHeaders }
       );
+    }
+
+    // -------------------------------------------------
+    // MCP Session Id handling
+    // -------------------------------------------------
+    // Headers are case-insensitive, but we'll check both common variants.
+    let sessionId =
+      req.headers.get("mcp-session-id") ||
+      req.headers.get("Mcp-Session-Id") ||
+      null;
+
+    if (!sessionId) {
+      try {
+        sessionId = crypto.randomUUID();
+      } catch {
+        // Fallback if crypto.randomUUID() isn't available
+        sessionId = `${connection_id}-session`;
+      }
     }
 
     // -------------------------------------------------
@@ -89,6 +114,7 @@ export async function POST(req: Request) {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
+        "Mcp-Session-Id": sessionId, // 👈 CRITICAL for Supabase MCP
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
       },
       body: JSON.stringify({
@@ -102,28 +128,31 @@ export async function POST(req: Request) {
     let json: any = null;
 
     // -------------------------------------------------
-    // Parse SSE stream
+    // Parse SSE stream (if MCP sends event-stream)
     // -------------------------------------------------
-    if (contentType.includes("text/event-stream")) {
-      const reader = response.body!.getReader();
+    if (contentType.includes("text/event-stream") && response.body) {
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let lastJSON = null;
+      let lastJSON: any = null;
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value);
+        buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
-        buffer = lines.pop()!;
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
           if (line.startsWith("data:")) {
             const raw = line.replace("data:", "").trim();
+            if (!raw) continue;
             try {
               lastJSON = JSON.parse(raw);
-            } catch {}
+            } catch {
+              // ignore malformed chunks
+            }
           }
         }
       }
@@ -138,9 +167,26 @@ export async function POST(req: Request) {
       json = await response.json().catch(() => null);
     }
 
+    // If upstream returned non-200, surface error but include raw JSON
+    if (!response.ok) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: `HTTP ${response.status}`,
+          response: json,
+          mcp_session_id: sessionId
+        },
+        { status: 200, headers: corsHeaders }
+      );
+    }
+
     if (!json) {
       return NextResponse.json(
-        { success: false, error: "MCP server returned empty response" },
+        {
+          success: false,
+          error: "MCP server returned empty response",
+          mcp_session_id: sessionId
+        },
         { status: 500, headers: corsHeaders }
       );
     }
@@ -165,14 +211,19 @@ export async function POST(req: Request) {
       }));
     }
 
-    // Fallback: generic MCP servers
+    // Fallback: generic MCP servers returning plain tools[]
     if (tools.length === 0) {
       tools = json?.result?.tools ?? json?.result ?? [];
     }
 
     if (!Array.isArray(tools)) {
       return NextResponse.json(
-        { success: false, error: "Invalid tools format", raw: json },
+        {
+          success: false,
+          error: "Invalid tools format",
+          raw: json,
+          mcp_session_id: sessionId
+        },
         { status: 500, headers: corsHeaders }
       );
     }
@@ -188,7 +239,7 @@ export async function POST(req: Request) {
       parameters_schema: normalizeSchema(tool.parameters_schema),
       is_enabled: true,
       updated_at: new Date().toISOString()
-    }));
+    ));
 
     // -------------------------------------------------
     // Overwrite existing → Upsert with onConflict
@@ -201,19 +252,22 @@ export async function POST(req: Request) {
 
     if (upErr) {
       return NextResponse.json(
-        { success: false, error: upErr.message },
+        {
+          success: false,
+          error: upErr.message,
+          mcp_session_id: sessionId
+        },
         { status: 500, headers: corsHeaders }
       );
     }
 
     return NextResponse.json(
-      { success: true, tools },
+      { success: true, tools, mcp_session_id: sessionId },
       { headers: corsHeaders }
     );
-
   } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: e.message },
+      { success: false, error: e.message, mcp_session_id: null },
       { status: 500, headers: corsHeaders }
     );
   }
