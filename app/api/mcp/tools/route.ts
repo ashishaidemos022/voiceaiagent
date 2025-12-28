@@ -158,6 +158,23 @@ export async function POST(req: Request) {
     // -------------------------------------------------
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
+    } else {
+      // Fallback: some servers omit/lie about content-type
+      const rawText = await response.text().catch(() => "");
+      if (rawText) {
+        try {
+          json = JSON.parse(rawText);
+        } catch {
+          return NextResponse.json(
+            {
+              success: false,
+              error: "MCP server returned non-JSON response",
+              raw: rawText.slice(0, 500)
+            },
+            { status: 500, headers: corsHeaders }
+          );
+        }
+      }
     }
 
     if (!json) {
