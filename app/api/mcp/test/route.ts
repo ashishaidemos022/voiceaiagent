@@ -13,7 +13,7 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   try {
-    const { connection_id } = await req.json();
+    const { connection_id, mcp_session_id } = await req.json();
 
     if (!connection_id) {
       return NextResponse.json(
@@ -45,14 +45,12 @@ export async function POST(req: Request) {
 
     // 2) Derive / generate MCP session id
     // Use a stable ID per connection if none provided by client
-    let sessionId = req.headers.get("mcp-session-id");
-    if (!sessionId) {
-      try {
-        sessionId = crypto.randomUUID();
-      } catch {
-        sessionId = `${connection_id}-session`;
-      }
-    }
+    const incomingSessionId =
+      req.headers.get("mcp-session-id") ||
+      req.headers.get("Mcp-Session-Id") ||
+      mcp_session_id ||
+      undefined;
+    const sessionId = incomingSessionId ?? undefined;
 
     // 3) Call MCP server with INITIALIZE (required first step in MCP lifecycle)
     const initBody = {
@@ -78,13 +76,17 @@ export async function POST(req: Request) {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        "Mcp-Session-Id": sessionId,
+        ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
       body: JSON.stringify(initBody),
     });
 
     const json = await response.json().catch(() => null);
+    const returnedSessionId =
+      response.headers.get("Mcp-Session-Id") ||
+      response.headers.get("mcp-session-id") ||
+      sessionId;
 
     // If HTTP error, surface it
     if (!response.ok) {
@@ -113,6 +115,23 @@ export async function POST(req: Request) {
 
     const result = json?.result;
 
+    // 3b) Notify server that initialization is complete (required by some MCP servers)
+    if (returnedSessionId) {
+      await fetch(conn.server_url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "Mcp-Session-Id": returnedSessionId,
+          ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "initialized",
+        }),
+      }).catch(() => null);
+    }
+
     // 4) Optionally mark connection as active if initialization succeeded
     await supabase
       .from("va_mcp_connections")
@@ -127,7 +146,7 @@ export async function POST(req: Request) {
       {
         success: true,
         response: result ?? json,
-        mcp_session_id: sessionId,
+        mcp_session_id: returnedSessionId,
       },
       { headers: corsHeaders }
     );
