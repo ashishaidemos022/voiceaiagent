@@ -82,7 +82,41 @@ export async function POST(req: Request) {
       body: JSON.stringify(initBody),
     });
 
-    const json = await response.json().catch(() => null);
+    const contentType = response.headers.get("content-type") || "";
+    let json: any = null;
+    let rawText: string | null = null;
+
+    if (contentType.includes("application/json")) {
+      json = await response.json().catch(() => null);
+    } else {
+      // Fallback: some servers omit or mislabel content-type
+      rawText = await response.text().catch(() => "");
+      if (rawText) {
+        try {
+          json = JSON.parse(rawText);
+        } catch {
+          // keep rawText for error payloads below
+        }
+      }
+    }
+
+    if (!json && rawText) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "MCP server returned non-JSON response",
+          raw: rawText.slice(0, 500)
+        },
+        { status: 200, headers: corsHeaders }
+      );
+    }
+
+    if (!json) {
+      return NextResponse.json(
+        { success: false, error: "MCP server returned empty response" },
+        { status: 200, headers: corsHeaders }
+      );
+    }
     const returnedSessionId =
       response.headers.get("Mcp-Session-Id") ||
       response.headers.get("mcp-session-id") ||
@@ -113,7 +147,33 @@ export async function POST(req: Request) {
       );
     }
 
-    const result = json?.result;
+    const tryParseJSON = (input: string) => {
+      const trimmed = input.trim();
+      if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+        return null;
+      }
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+    };
+
+    let result = json?.result ?? json;
+
+    // OpenAI Agent Builder-style tool output: { content: [{ type: "text", text: "..." }] }
+    const contentBlocks = result?.content ?? json?.content;
+    if (Array.isArray(contentBlocks)) {
+      const textParts = contentBlocks
+        .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+        .map((part: any) => part.text);
+
+      if (textParts.length > 0) {
+        const combined = textParts.join("");
+        const parsed = tryParseJSON(combined);
+        result = parsed ?? { content: combined };
+      }
+    }
 
     // 3b) Notify server that initialization is complete (required by some MCP servers)
     if (returnedSessionId) {

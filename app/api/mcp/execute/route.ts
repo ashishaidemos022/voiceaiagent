@@ -119,6 +119,7 @@ export async function POST(req: Request) {
 
     const contentType = response.headers.get("content-type") || "";
     let json: any = null;
+    let rawText: string | null = null;
 
     /* ----------------------------------------------------
        8. Handle SSE (Rube uses SSE for multi-step tools)
@@ -141,6 +142,7 @@ export async function POST(req: Request) {
         for (const line of lines) {
           if (line.startsWith("data:")) {
             const raw = line.replace("data:", "").trim();
+            if (!raw || raw === "[DONE]") continue;
             try {
               lastJSON = JSON.parse(raw);
             } catch {
@@ -159,8 +161,31 @@ export async function POST(req: Request) {
     else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
     } else {
+      // Fallback: some servers omit or mislabel content-type
+      rawText = await response.text().catch(() => "");
+      if (rawText) {
+        try {
+          json = JSON.parse(rawText);
+        } catch {
+          // keep rawText for error payloads below
+        }
+      }
+    }
+
+    if (!json && rawText) {
       return NextResponse.json(
-        { success: false, error: "Unknown response format" },
+        {
+          success: false,
+          error: "MCP server returned non-JSON response",
+          raw: rawText.slice(0, 500)
+        },
+        { status: 500, headers: corsHeaders }
+      );
+    }
+
+    if (!json) {
+      return NextResponse.json(
+        { success: false, error: "MCP server returned empty response" },
         { status: 500, headers: corsHeaders }
       );
     }
@@ -184,7 +209,33 @@ export async function POST(req: Request) {
        11. Rube multi-tool normalization
            Detect: RUBE_MULTI_EXECUTE_TOOL
     ---------------------------------------------------- */
+    const tryParseJSON = (input: string) => {
+      const trimmed = input.trim();
+      if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+        return null;
+      }
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+    };
+
     let resultPayload = json?.result ?? json;
+
+    // OpenAI Agent Builder-style tool output: { content: [{ type: "text", text: "..." }] }
+    const contentBlocks = resultPayload?.content ?? json?.content;
+    if (Array.isArray(contentBlocks)) {
+      const textParts = contentBlocks
+        .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+        .map((part: any) => part.text);
+
+      if (textParts.length > 0) {
+        const combined = textParts.join("");
+        const parsed = tryParseJSON(combined);
+        resultPayload = parsed ?? { content: combined };
+      }
+    }
 
     const isRubeMulti =
       tool_name === "RUBE_MULTI_EXECUTE_TOOL" &&
