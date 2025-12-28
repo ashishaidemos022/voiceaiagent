@@ -100,7 +100,7 @@ export async function POST(req: Request) {
     const sessionId = incomingSessionId || crypto.randomUUID();
 
     // -------------------------------------------------
-    // Call MCP server (tools/list)
+    // Call MCP server (tools/list or similar)
     // -------------------------------------------------
     const response = await fetch(conn.server_url, {
       method: "POST",
@@ -187,16 +187,18 @@ export async function POST(req: Request) {
         description: tool.description || "",
         parameters_schema: normalizeSchema(
           tool.parameters_schema ||
-          tool.input_schema ||
-          tool.inputSchema ||
-          tool.schema ||
-          {}
+            tool.params ||                // <— extra safety
+            tool.input_schema ||
+            tool.inputSchema ||
+            tool.schema ||
+            {}
         )
       }));
     }
 
-    // 2) Generic MCP (Supabase etc.) including object=list, data=[...]
+    // 2) Generic MCP (Supabase / OpenAI Agent Builder list_actions-style)
     if (tools.length === 0) {
+      // OpenAI/JSON-RPC servers may wrap result, or be bare
       const result = json.result ?? json;
       let rawTools: any = null;
 
@@ -216,26 +218,33 @@ export async function POST(req: Request) {
       else if (Array.isArray(json.tools)) {
         rawTools = json.tools;
       }
-      // Supabase-style: { object: "list", data: [ { object: "tool", ... } ] }
+      // { object: "list", data: [...] } — OpenAI list_actions / generic list
       else if (result?.object === "list" && Array.isArray(result?.data)) {
-        rawTools = result.data.map((item: any) => {
-          // sometimes tool lives under item.tool, otherwise item itself
-          return item.tool || item;
-        });
+        // items may be { tool: {...} } or already tool objects
+        rawTools = result.data.map((item: any) => item.tool || item);
       }
 
       if (Array.isArray(rawTools)) {
         tools = rawTools.map((tool: any) => ({
           name: tool.name,
           description: tool.description || "",
+          /**
+           * IMPORTANT:
+           * OpenAI Agent Builder `list_actions` uses `params` as the
+           * JSON Schema for the tool arguments, so we include `tool.params`
+           * in the priority chain here.
+           */
           parameters_schema: normalizeSchema(
             tool.parameters_schema ||
-            tool.parameters ||
-            tool.input_schema ||
-            tool.inputSchema ||
-            tool.schema ||
-            {}
-          )
+              tool.parameters ||
+              tool.params ||          // <— handles the response you pasted
+              tool.input_schema ||
+              tool.inputSchema ||
+              tool.schema ||
+              {}
+          ),
+          // If you ever add a column for return schema, you could store:
+          // return_schema: normalizeSchema(tool.return_type)
         }));
       }
     }
