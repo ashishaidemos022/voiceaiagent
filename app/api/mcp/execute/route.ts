@@ -101,7 +101,72 @@ export async function POST(req: Request) {
       incomingHeaders.get("mcp-session-id") ||
       undefined;
 
-    const sessionId = incomingSessionId || crypto.randomUUID();
+    const sessionId = incomingSessionId || undefined;
+
+    /* ----------------------------------------------------
+       6b. Initialize MCP session if required
+    ---------------------------------------------------- */
+    const ensureInitialized = async () => {
+      const initBody = {
+        jsonrpc: "2.0",
+        id: "initialize-1",
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: { roots: {}, sampling: {} },
+          clientInfo: { name: "va-mcp-proxy", version: "0.1.0" }
+        }
+      };
+
+      const initRes = await fetch(conn.server_url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+          ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
+        },
+        body: JSON.stringify(initBody)
+      });
+
+      const initJson = await initRes.json().catch(() => null);
+      if (!initRes.ok || initJson?.error) {
+        return { ok: false as const, json: initJson };
+      }
+
+      const returnedSessionId =
+        initRes.headers.get("Mcp-Session-Id") ||
+        initRes.headers.get("mcp-session-id") ||
+        sessionId;
+
+      if (returnedSessionId) {
+        await fetch(conn.server_url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "Mcp-Session-Id": returnedSessionId,
+            ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "initialized"
+          })
+        }).catch(() => null);
+      }
+
+      return { ok: true as const, sessionId: returnedSessionId };
+    };
+
+    const initResult = await ensureInitialized();
+    if (!initResult.ok) {
+      return NextResponse.json(
+        { success: false, error: "MCP initialize failed", raw: initResult.json },
+        { status: 500, headers: corsHeaders }
+      );
+    }
+
+    const effectiveSessionId = initResult.sessionId || crypto.randomUUID();
 
     /* ----------------------------------------------------
        7. Call MCP server over JSON-RPC
@@ -111,7 +176,7 @@ export async function POST(req: Request) {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        "Mcp-Session-Id": sessionId,
+        "Mcp-Session-Id": effectiveSessionId,
         ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
       body: JSON.stringify(rpcBody),
@@ -199,7 +264,7 @@ export async function POST(req: Request) {
           success: false,
           error: `HTTP ${response.status}`,
           response: json,
-          mcp_session_id: sessionId,
+          mcp_session_id: effectiveSessionId,
         },
         { headers: corsHeaders }
       );
@@ -274,7 +339,7 @@ export async function POST(req: Request) {
         normalized_args: normalized,
         normalization_logs: logs,
         result: resultPayload,
-        mcp_session_id: sessionId,
+        mcp_session_id: effectiveSessionId,
       },
       { headers: corsHeaders }
     );
