@@ -44,56 +44,81 @@ export async function POST(req: Request) {
     }
 
     // 2) Derive / generate MCP session id
-    // Headers are case-insensitive; "mcp-session-id" works here
+    // Use a stable ID per connection if none provided by client
     let sessionId = req.headers.get("mcp-session-id");
-
     if (!sessionId) {
-      // Generate a stable default based on connection_id for now,
-      // so repeated tests for same connection share a session.
-      // If you prefer fully random each time, use crypto.randomUUID().
       try {
         sessionId = crypto.randomUUID();
       } catch {
-        // Fallback if crypto.randomUUID isn't available for some reason
         sessionId = `${connection_id}-session`;
       }
     }
 
-    // 3) Call the Supabase MCP server with required header
+    // 3) Call MCP server with INITIALIZE (required first step in MCP lifecycle)
+    const initBody = {
+      jsonrpc: "2.0",
+      id: "initialize-1",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26", // or "2024-11-05" if your server only supports that
+        capabilities: {
+          // minimal client capabilities; adjust if you support more
+          roots: {},
+          sampling: {},
+        },
+        clientInfo: {
+          name: "va-mcp-proxy",
+          version: "0.1.0",
+        },
+      },
+    };
+
     const response = await fetch(conn.server_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
         "Mcp-Session-Id": sessionId,
-        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {})
+        ...(conn.api_key ? { Authorization: `Bearer ${conn.api_key}` } : {}),
       },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "ping",
-        method: "ping"
-      })
+      body: JSON.stringify(initBody),
     });
 
     const json = await response.json().catch(() => null);
 
+    // If HTTP error, surface it
     if (!response.ok) {
       return NextResponse.json(
         {
           success: false,
           error: `HTTP ${response.status}`,
-          response: json
+          response: json,
         },
-        { status: 200, headers: corsHeaders } // keep outer API 200 for your client contract
+        { status: 200, headers: corsHeaders }
       );
     }
 
-    // 4) Update connection health in Supabase
+    // If MCP JSON-RPC error, surface that too
+    if (json?.error) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: json.error.message || "MCP initialization error",
+          code: json.error.code,
+          response: json,
+        },
+        { status: 200, headers: corsHeaders }
+      );
+    }
+
+    const result = json?.result;
+
+    // 4) Optionally mark connection as active if initialization succeeded
     await supabase
       .from("va_mcp_connections")
       .update({
         status: "active",
-        last_health_check: new Date().toISOString()
+        last_health_check: new Date().toISOString(),
       })
       .eq("id", connection_id);
 
@@ -101,8 +126,8 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         success: true,
-        response: json,
-        mcp_session_id: sessionId
+        response: result ?? json,
+        mcp_session_id: sessionId,
       },
       { headers: corsHeaders }
     );
