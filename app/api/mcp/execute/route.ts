@@ -186,6 +186,22 @@ export async function POST(req: Request) {
     let json: any = null;
     let rawText: string | null = null;
 
+    const parseSSELastJSONFromText = (text: string) => {
+      const lines = text.split(/\r?\n/);
+      let lastJSON: any = null;
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const raw = line.slice(5).trim();
+        if (!raw || raw === "[DONE]") continue;
+        try {
+          lastJSON = JSON.parse(raw);
+        } catch {
+          /* ignore non-JSON data lines */
+        }
+      }
+      return lastJSON;
+    };
+
     /* ----------------------------------------------------
        8. Handle SSE (Rube uses SSE for multi-step tools)
     ---------------------------------------------------- */
@@ -232,6 +248,7 @@ export async function POST(req: Request) {
         try {
           json = JSON.parse(rawText);
         } catch {
+          json = parseSSELastJSONFromText(rawText);
           // keep rawText for error payloads below
         }
       }

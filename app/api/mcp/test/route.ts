@@ -86,7 +86,35 @@ export async function POST(req: Request) {
     let json: any = null;
     let rawText: string | null = null;
 
-    if (contentType.includes("application/json")) {
+    if (contentType.includes("text/event-stream")) {
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let lastJSON: any = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data:")) {
+            const raw = line.replace("data:", "").trim();
+            if (!raw || raw === "[DONE]") continue;
+            try {
+              lastJSON = JSON.parse(raw);
+            } catch {
+              // ignore malformed chunks
+            }
+          }
+        }
+      }
+
+      json = lastJSON ?? {};
+    } else if (contentType.includes("application/json")) {
       json = await response.json().catch(() => null);
     } else {
       // Fallback: some servers omit or mislabel content-type
